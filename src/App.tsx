@@ -12,6 +12,15 @@ import { Progress } from './components/ui/progress'
 import { Alert, AlertDescription } from './components/ui/alert'
 import { Separator } from './components/ui/separator'
 import { Badge } from './components/ui/badge'
+import { Toaster } from './components/ui/toaster'
+import { useToast } from './hooks/use-toast'
+import { PDFDocument, PDFForm } from 'pdf-lib'
+import { Document, Page, pdfjs } from 'react-pdf'
+import 'react-pdf/dist/Page/AnnotationLayer.css'
+import 'react-pdf/dist/Page/TextLayer.css'
+
+// Set up PDF.js worker
+pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`
 
 interface FormField {
   id: string
@@ -30,6 +39,8 @@ interface UploadedFile {
   size: number
   uploadDate: Date
   fields: FormField[]
+  pdfBytes: Uint8Array // Store original PDF data
+  pdfUrl: string // URL for PDF viewing
 }
 
 function App() {
@@ -38,7 +49,9 @@ function App() {
   const [isDragOver, setIsDragOver] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
   const [progress, setProgress] = useState(0)
-  const [notification, setNotification] = useState<{ type: 'success' | 'error', message: string } | null>(null)
+  const [numPages, setNumPages] = useState<number | null>(null)
+  const [pageNumber, setPageNumber] = useState(1)
+  const { toast } = useToast()
 
   // Mock form fields for demonstration
   const mockFormFields = useMemo<FormField[]>(() => [
@@ -101,6 +114,117 @@ function App() {
     }
   ], [])
 
+  const handleFileUpload = useCallback(async (files: File[]) => {
+    const pdfFiles = files.filter(file => file.type === 'application/pdf')
+    
+    if (pdfFiles.length === 0) {
+      toast({
+        title: "Error",
+        description: "Please upload PDF files only.",
+        variant: "destructive",
+      })
+      return
+    }
+
+    setIsProcessing(true)
+    setProgress(0)
+
+    for (let i = 0; i < pdfFiles.length; i++) {
+      const file = pdfFiles[i]
+      
+      try {
+        // Read the PDF file as bytes
+        const arrayBuffer = await file.arrayBuffer()
+        const pdfBytes = new Uint8Array(arrayBuffer)
+        
+        // Create URL for PDF viewing
+        const pdfBlob = new Blob([pdfBytes], { type: 'application/pdf' })
+        const pdfUrl = URL.createObjectURL(pdfBlob)
+        
+        // Load the PDF to detect form fields
+        let detectedFields: FormField[] = []
+        try {
+          const pdfDoc = await PDFDocument.load(pdfBytes)
+          const form = pdfDoc.getForm()
+          const formFields = form.getFields()
+          
+          // Create form field objects from detected PDF fields
+          detectedFields = formFields.map((field, index) => {
+            const fieldName = field.getName()
+            let fieldType: FormField['type'] = 'text'
+            
+            // Determine field type based on PDF field type
+            if (field.constructor.name.includes('Text')) {
+              fieldType = 'text'
+            } else if (field.constructor.name.includes('CheckBox')) {
+              fieldType = 'checkbox'
+            } else if (field.constructor.name.includes('RadioGroup')) {
+              fieldType = 'radio'
+            } else if (field.constructor.name.includes('Dropdown')) {
+              fieldType = 'select'
+            }
+            
+            return {
+              id: `field_${index}`,
+              name: fieldName,
+              type: fieldType,
+              label: fieldName.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase()),
+              value: fieldType === 'checkbox' ? false : '',
+              required: false,
+              placeholder: `Enter ${fieldName}`
+            }
+          })
+        } catch (formError) {
+          console.warn('Could not detect form fields:', formError)
+        }
+        
+        // If no form fields detected, use mock fields
+        const fieldsToUse = detectedFields.length > 0 ? detectedFields : mockFormFields.map(field => ({ ...field, value: field.type === 'checkbox' ? false : '' }))
+        
+        // Show info about detected fields
+        if (detectedFields.length > 0) {
+          console.log(`Detected ${detectedFields.length} form fields in ${file.name}:`, detectedFields.map(f => f.name))
+        } else {
+          console.log(`No form fields detected in ${file.name}, using mock fields for demonstration`)
+        }
+        
+        // Update progress
+        setProgress(((i + 1) / pdfFiles.length) * 100)
+
+        const newFile: UploadedFile = {
+          id: Date.now().toString() + i,
+          name: file.name,
+          size: file.size,
+          uploadDate: new Date(),
+          fields: fieldsToUse,
+          pdfBytes: pdfBytes,
+          pdfUrl: pdfUrl
+        }
+
+        setUploadedFiles(prev => [...prev, newFile])
+        
+        if (!selectedFile) {
+          setSelectedFile(newFile)
+        }
+        
+      } catch (error) {
+        console.error('Error processing PDF:', error)
+        toast({
+          title: "Error",
+          description: `Failed to process ${file.name}. Please ensure it's a valid PDF.`,
+          variant: "destructive",
+        })
+      }
+    }
+
+    setIsProcessing(false)
+    setProgress(0)
+    toast({
+      title: "Success",
+      description: `Successfully uploaded ${pdfFiles.length} PDF file(s).`,
+    })
+  }, [mockFormFields, selectedFile, toast])
+
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragOver(true)
@@ -119,45 +243,14 @@ function App() {
     handleFileUpload(files)
   }, [handleFileUpload])
 
-  const handleFileUpload = useCallback(async (files: File[]) => {
-    const pdfFiles = files.filter(file => file.type === 'application/pdf')
-    
-    if (pdfFiles.length === 0) {
-      setNotification({ type: 'error', message: 'Please upload PDF files only.' })
-      return
+  const handleFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    if (files.length > 0) {
+      handleFileUpload(files)
     }
-
-    setIsProcessing(true)
-    setProgress(0)
-
-    for (let i = 0; i < pdfFiles.length; i++) {
-      const file = pdfFiles[i]
-      
-      // Simulate processing time
-      for (let j = 0; j <= 100; j += 10) {
-        setProgress(j)
-        await new Promise(resolve => setTimeout(resolve, 50))
-      }
-
-      const newFile: UploadedFile = {
-        id: Date.now().toString() + i,
-        name: file.name,
-        size: file.size,
-        uploadDate: new Date(),
-        fields: mockFormFields.map(field => ({ ...field, value: field.type === 'checkbox' ? false : '' }))
-      }
-
-      setUploadedFiles(prev => [...prev, newFile])
-      
-      if (!selectedFile) {
-        setSelectedFile(newFile)
-      }
-    }
-
-    setIsProcessing(false)
-    setProgress(0)
-    setNotification({ type: 'success', message: `Successfully uploaded ${pdfFiles.length} PDF file(s).` })
-  }, [mockFormFields, selectedFile])
+    // Reset the input value so the same file can be uploaded again
+    e.target.value = ''
+  }, [handleFileUpload])
 
   const handleFieldChange = (fieldId: string, value: string | boolean) => {
     if (!selectedFile) return
@@ -175,10 +268,86 @@ function App() {
     )
   }
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!selectedFile) return
     
-    setNotification({ type: 'success', message: 'PDF downloaded successfully!' })
+    try {
+      // Load the original PDF
+      const pdfDoc = await PDFDocument.load(selectedFile.pdfBytes)
+      const form = pdfDoc.getForm()
+      
+      // Fill the form fields with user data
+      selectedFile.fields.forEach(field => {
+        try {
+          if (field.value) {
+            if (field.type === 'checkbox') {
+              const checkboxField = form.getCheckBox(field.name)
+              if (field.value) {
+                checkboxField.check()
+              } else {
+                checkboxField.uncheck()
+              }
+            } else if (field.type === 'radio') {
+              const radioGroup = form.getRadioGroup(field.name)
+              radioGroup.select(field.value as string)
+            } else if (field.type === 'select') {
+              const dropdown = form.getDropdown(field.name)
+              dropdown.select(field.value as string)
+            } else {
+              // Text fields
+              const textField = form.getTextField(field.name)
+              textField.setText(field.value as string)
+            }
+          }
+        } catch (fieldError) {
+          console.warn(`Could not fill field ${field.name}:`, fieldError)
+          // Continue with other fields even if one fails
+        }
+      })
+      
+      // Flatten the form to make it non-editable (optional)
+      // form.flatten()
+      
+      // Save the filled PDF
+      const filledPdfBytes = await pdfDoc.save()
+      
+      // Create blob and download
+      const blob = new Blob([filledPdfBytes], { type: 'application/pdf' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `filled-${selectedFile.name.replace('.pdf', '')}-${Date.now()}.pdf`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+      
+      toast({
+        title: "Success",
+        description: "Filled PDF downloaded successfully!",
+      })
+    } catch (error) {
+      console.error('Error filling PDF:', error)
+      toast({
+        title: "Error",
+        description: "Failed to fill and download PDF. Please try again.",
+        variant: "destructive",
+      })
+    }
+  }
+
+  const onDocumentLoadSuccess = ({ numPages }: { numPages: number }) => {
+    setNumPages(numPages)
+    setPageNumber(1)
+  }
+
+  const onDocumentLoadError = (error: Error) => {
+    console.error('Error loading PDF:', error)
+    toast({
+      title: "Error",
+      description: "Failed to load PDF for preview.",
+      variant: "destructive",
+    })
   }
 
   const getCompletionPercentage = () => {
@@ -284,28 +453,14 @@ function App() {
               </div>
               <Button onClick={handleDownload} className="bg-blue-600 hover:bg-blue-700">
                 <Download className="h-4 w-4 mr-2" />
-                Download PDF
+                Download Filled PDF
               </Button>
             </div>
           )}
         </div>
       </header>
 
-      {/* Notification */}
-      {notification && (
-        <div className="max-w-7xl mx-auto px-6 pt-4">
-          <Alert className={notification.type === 'success' ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'}>
-            {notification.type === 'success' ? (
-              <Check className="h-4 w-4 text-green-600" />
-            ) : (
-              <AlertCircle className="h-4 w-4 text-red-600" />
-            )}
-            <AlertDescription className={notification.type === 'success' ? 'text-green-800' : 'text-red-800'}>
-              {notification.message}
-            </AlertDescription>
-          </Alert>
-        </div>
-      )}
+
 
       <div className="max-w-7xl mx-auto px-6 py-6">
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 h-[calc(100vh-200px)]">
@@ -344,7 +499,7 @@ function App() {
                     multiple
                     accept=".pdf"
                     className="hidden"
-                    onChange={(e) => handleFileUpload(Array.from(e.target.files || []))}
+                    onChange={handleFileInputChange}
                   />
                 </div>
 
@@ -398,25 +553,61 @@ function App() {
                 <CardHeader>
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-lg">PDF Preview</CardTitle>
-                    <Badge variant="outline">
-                      {getCompletionPercentage()}% Complete
-                    </Badge>
+                    <div className="flex items-center space-x-2">
+                      {numPages && (
+                        <div className="flex items-center space-x-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setPageNumber(Math.max(1, pageNumber - 1))}
+                            disabled={pageNumber <= 1}
+                          >
+                            Previous
+                          </Button>
+                          <span className="text-sm text-gray-600">
+                            Page {pageNumber} of {numPages}
+                          </span>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setPageNumber(Math.min(numPages, pageNumber + 1))}
+                            disabled={pageNumber >= numPages}
+                          >
+                            Next
+                          </Button>
+                        </div>
+                      )}
+                      <Badge variant="outline">
+                        {getCompletionPercentage()}% Complete
+                      </Badge>
+                    </div>
                   </div>
                 </CardHeader>
-                <CardContent className="h-full">
-                  <div className="h-full bg-gray-100 rounded-lg flex items-center justify-center">
-                    <div className="text-center">
-                      <FileText className="h-16 w-16 text-gray-400 mx-auto mb-4" />
-                      <h3 className="text-lg font-medium text-gray-900 mb-2">
-                        {selectedFile.name}
-                      </h3>
-                      <p className="text-sm text-gray-600">
-                        PDF preview will be displayed here
-                      </p>
-                      <p className="text-xs text-gray-500 mt-2">
-                        Form fields detected: {selectedFile.fields.length}
-                      </p>
-                    </div>
+                <CardContent className="h-full overflow-auto">
+                  <div className="flex justify-center">
+                    <Document
+                      file={selectedFile.pdfUrl}
+                      onLoadSuccess={onDocumentLoadSuccess}
+                      onLoadError={onDocumentLoadError}
+                      loading={
+                        <div className="flex items-center justify-center h-96">
+                          <div className="text-center">
+                            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-2"></div>
+                            <p className="text-sm text-gray-600">Loading PDF...</p>
+                          </div>
+                        </div>
+                      }
+                    >
+                      <Page
+                        pageNumber={pageNumber}
+                        width={Math.min(600, window.innerWidth - 100)}
+                        renderTextLayer={false}
+                        renderAnnotationLayer={true}
+                      />
+                    </Document>
+                  </div>
+                  <div className="mt-4 text-center text-xs text-gray-500">
+                    Form fields detected: {selectedFile.fields.length}
                   </div>
                 </CardContent>
               </Card>
@@ -469,6 +660,7 @@ function App() {
           </div>
         </div>
       </div>
+      <Toaster />
     </div>
   )
 }
