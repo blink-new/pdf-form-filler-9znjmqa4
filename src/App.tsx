@@ -19,8 +19,16 @@ import { Document, Page, pdfjs } from 'react-pdf'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 
-// Set up PDF.js worker
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`
+// Set up PDF.js worker with fallback
+try {
+  pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+    'pdfjs-dist/build/pdf.worker.min.js',
+    import.meta.url,
+  ).toString()
+} catch (error) {
+  // Fallback to CDN if local worker fails
+  pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`
+}
 
 interface FormField {
   id: string
@@ -52,6 +60,17 @@ function App() {
   const [numPages, setNumPages] = useState<number | null>(null)
   const [pageNumber, setPageNumber] = useState(1)
   const { toast } = useToast()
+
+  // Cleanup PDF URLs on unmount
+  React.useEffect(() => {
+    return () => {
+      uploadedFiles.forEach(file => {
+        if (file.pdfUrl) {
+          URL.revokeObjectURL(file.pdfUrl)
+        }
+      })
+    }
+  }, [uploadedFiles])
 
   // Mock form fields for demonstration
   const mockFormFields = useMemo<FormField[]>(() => [
@@ -137,7 +156,7 @@ function App() {
         const arrayBuffer = await file.arrayBuffer()
         const pdfBytes = new Uint8Array(arrayBuffer)
         
-        // Create URL for PDF viewing
+        // Create URL for PDF viewing with proper MIME type
         const pdfBlob = new Blob([pdfBytes], { type: 'application/pdf' })
         const pdfUrl = URL.createObjectURL(pdfBlob)
         
@@ -272,41 +291,88 @@ function App() {
     if (!selectedFile) return
     
     try {
+      toast({
+        title: "Processing",
+        description: "Preparing your filled PDF for download...",
+      })
+
       // Load the original PDF
       const pdfDoc = await PDFDocument.load(selectedFile.pdfBytes)
-      const form = pdfDoc.getForm()
       
-      // Fill the form fields with user data
-      selectedFile.fields.forEach(field => {
-        try {
-          if (field.value) {
-            if (field.type === 'checkbox') {
-              const checkboxField = form.getCheckBox(field.name)
-              if (field.value) {
-                checkboxField.check()
+      // Check if PDF has a form
+      let form: PDFForm | null = null
+      try {
+        form = pdfDoc.getForm()
+      } catch (formError) {
+        console.warn('PDF does not have fillable form fields:', formError)
+      }
+      
+      // If PDF has form fields, try to fill them
+      if (form) {
+        const formFields = form.getFields()
+        console.log('Available form fields:', formFields.map(f => f.getName()))
+        
+        selectedFile.fields.forEach(field => {
+          try {
+            if (field.value && field.value !== '') {
+              // Try to find the field in the actual PDF form
+              const pdfField = formFields.find(f => f.getName() === field.name)
+              if (pdfField) {
+                if (field.type === 'checkbox') {
+                  const checkboxField = form.getCheckBox(field.name)
+                  if (field.value) {
+                    checkboxField.check()
+                  } else {
+                    checkboxField.uncheck()
+                  }
+                } else if (field.type === 'radio') {
+                  const radioGroup = form.getRadioGroup(field.name)
+                  radioGroup.select(field.value as string)
+                } else if (field.type === 'select') {
+                  const dropdown = form.getDropdown(field.name)
+                  dropdown.select(field.value as string)
+                } else {
+                  // Text fields
+                  const textField = form.getTextField(field.name)
+                  textField.setText(field.value as string)
+                }
+                console.log(`Successfully filled field: ${field.name} = ${field.value}`)
               } else {
-                checkboxField.uncheck()
+                console.warn(`Field ${field.name} not found in PDF form`)
               }
-            } else if (field.type === 'radio') {
-              const radioGroup = form.getRadioGroup(field.name)
-              radioGroup.select(field.value as string)
-            } else if (field.type === 'select') {
-              const dropdown = form.getDropdown(field.name)
-              dropdown.select(field.value as string)
-            } else {
-              // Text fields
-              const textField = form.getTextField(field.name)
-              textField.setText(field.value as string)
             }
+          } catch (fieldError) {
+            console.warn(`Could not fill field ${field.name}:`, fieldError)
+            // Continue with other fields even if one fails
           }
-        } catch (fieldError) {
-          console.warn(`Could not fill field ${field.name}:`, fieldError)
-          // Continue with other fields even if one fails
-        }
-      })
-      
-      // Flatten the form to make it non-editable (optional)
-      // form.flatten()
+        })
+      } else {
+        // If no form fields, create a simple text overlay (fallback)
+        console.log('No form fields found, creating a data summary page')
+        
+        // Add a new page with the form data as text
+        const page = pdfDoc.addPage()
+        const { width, height } = page.getSize()
+        
+        page.drawText('Form Data Summary', {
+          x: 50,
+          y: height - 50,
+          size: 16,
+        })
+        
+        let yPosition = height - 100
+        selectedFile.fields.forEach(field => {
+          if (field.value && field.value !== '') {
+            const text = `${field.label}: ${field.value}`
+            page.drawText(text, {
+              x: 50,
+              y: yPosition,
+              size: 12,
+            })
+            yPosition -= 25
+          }
+        })
+      }
       
       // Save the filled PDF
       const filledPdfBytes = await pdfDoc.save()
@@ -329,8 +395,8 @@ function App() {
     } catch (error) {
       console.error('Error filling PDF:', error)
       toast({
-        title: "Error",
-        description: "Failed to fill and download PDF. Please try again.",
+        title: "Download Error",
+        description: `Failed to process PDF: ${error.message}. The PDF may be password-protected or corrupted.`,
         variant: "destructive",
       })
     }
@@ -344,8 +410,8 @@ function App() {
   const onDocumentLoadError = (error: Error) => {
     console.error('Error loading PDF:', error)
     toast({
-      title: "Error",
-      description: "Failed to load PDF for preview.",
+      title: "PDF Preview Error",
+      description: "Failed to load PDF for preview. The file may be corrupted or password-protected.",
       variant: "destructive",
     })
   }
@@ -589,11 +655,25 @@ function App() {
                       file={selectedFile.pdfUrl}
                       onLoadSuccess={onDocumentLoadSuccess}
                       onLoadError={onDocumentLoadError}
+                      options={{
+                        cMapUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/cmaps/',
+                        cMapPacked: true,
+                        standardFontDataUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/standard_fonts/',
+                      }}
                       loading={
                         <div className="flex items-center justify-center h-96">
                           <div className="text-center">
                             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-2"></div>
                             <p className="text-sm text-gray-600">Loading PDF...</p>
+                          </div>
+                        </div>
+                      }
+                      error={
+                        <div className="flex items-center justify-center h-96">
+                          <div className="text-center">
+                            <AlertCircle className="h-12 w-12 text-red-500 mx-auto mb-2" />
+                            <p className="text-sm text-red-600 mb-2">Failed to load PDF</p>
+                            <p className="text-xs text-gray-500">The file may be corrupted or password-protected</p>
                           </div>
                         </div>
                       }
@@ -603,6 +683,9 @@ function App() {
                         width={Math.min(600, window.innerWidth - 100)}
                         renderTextLayer={false}
                         renderAnnotationLayer={true}
+                        onLoadError={(error) => {
+                          console.error('Page load error:', error)
+                        }}
                       />
                     </Document>
                   </div>
